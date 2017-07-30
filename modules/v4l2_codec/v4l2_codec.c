@@ -40,11 +40,19 @@
  */
 
 
+#define MAX_BUFFERS 4
+
+
+struct buffer {
+	void  *start;
+	size_t length;
+};
+
 struct vidsrc_st {
 	const struct vidsrc *vs;  /* inheritance */
 
-	uint8_t *buffer;
-	size_t buffer_len;
+	struct buffer buffers[MAX_BUFFERS];
+	unsigned int  n_buffers;
 	int fd;
 	struct {
 		unsigned n_key;
@@ -179,13 +187,11 @@ static int print_caps(int fd, unsigned width, unsigned height)
 static int init_mmap(struct vidsrc_st *st, int fd)
 {
 	struct v4l2_requestbuffers req;
-	struct v4l2_buffer buf;
 	int err;
 
 	memset(&req, 0, sizeof(req));
-	memset(&buf, 0, sizeof(buf));
 
-	req.count = 1;
+	req.count = MAX_BUFFERS;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_MMAP;
 
@@ -195,41 +201,65 @@ static int init_mmap(struct vidsrc_st *st, int fd)
 		return err;
 	}
 
-	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf.memory = V4L2_MEMORY_MMAP;
-	buf.index = 0;
-	if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf)) {
-		err = errno;
-		warning("v4l2_codec: Querying Buffer (%m)\n", err);
-		return err;
+	debug("v4l2_codec: requested %u, got %u buffers\n",
+	      MAX_BUFFERS, req.count);
+
+	if (req.count < 2) {
+		warning("v4l2_codec: Insufficient buffer memory\n");
+		return ENOMEM;
 	}
 
-	st->buffer = mmap(NULL, buf.length,
-			  PROT_READ | PROT_WRITE, MAP_SHARED,
-			  fd, buf.m.offset);
-	if (st->buffer == MAP_FAILED) {
-		err = errno;
-		warning("v4l2_codec: mmap failed (%m)\n", err);
-		return err;
+	for (st->n_buffers = 0; st->n_buffers<req.count; ++st->n_buffers) {
+		struct v4l2_buffer buf;
+
+		memset(&buf, 0, sizeof(buf));
+
+		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index  = st->n_buffers;
+
+		if (-1 == xioctl(st->fd, VIDIOC_QUERYBUF, &buf)) {
+			warning("v4l2_codec: VIDIOC_QUERYBUF\n");
+			return errno;
+		}
+
+		st->buffers[st->n_buffers].length = buf.length;
+		st->buffers[st->n_buffers].start =
+			mmap(NULL /* start anywhere */,
+				  buf.length,
+				  PROT_READ | PROT_WRITE /* required */,
+				  MAP_SHARED /* recommended */,
+				  st->fd, buf.m.offset);
+
+		if (MAP_FAILED == st->buffers[st->n_buffers].start) {
+			warning("v4l2_codec: mmap failed\n");
+			return ENODEV;
+		}
+
+		debug("v4l2_codec: index %u, buffer length is %u bytes\n",
+		      buf.index, buf.length);
 	}
-	st->buffer_len = buf.length;
 
 	return 0;
 }
 
 
-static int query_buffer(int fd)
+static int query_buffers(struct vidsrc_st *st)
 {
-	struct v4l2_buffer buf;
+	unsigned int i;
 
-	memset(&buf, 0, sizeof(buf));
+	for (i = 0; i < st->n_buffers; ++i) {
+		struct v4l2_buffer buf;
 
-	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf.memory = V4L2_MEMORY_MMAP;
-	buf.index = 0;
+		memset(&buf, 0, sizeof(buf));
 
-	if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-		return errno;
+		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index  = i;
+
+		if (-1 == xioctl (st->fd, VIDIOC_QBUF, &buf))
+			return errno;
+	}
 
 	return 0;
 }
@@ -298,6 +328,7 @@ static void encoders_read(uint32_t rtp_ts, const uint8_t *buf, size_t sz)
 static void read_handler(int flags, void *arg)
 {
 	struct vidsrc_st *st = arg;
+	const struct buffer *buffer;
 	struct v4l2_buffer buf;
 	bool keyframe = false;
 	struct timeval ts;
@@ -313,7 +344,6 @@ static void read_handler(int flags, void *arg)
 
 	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	buf.memory = V4L2_MEMORY_MMAP;
-	buf.index = 0;
 
 	if (-1 == xioctl(st->fd, VIDIOC_DQBUF, &buf)) {
 		err = errno;
@@ -321,12 +351,21 @@ static void read_handler(int flags, void *arg)
 		return;
 	}
 
+	if (buf.index >= st->n_buffers) {
+		warning("v4l2_codec: read: index >= n_buffers\n");
+		goto out;
+	}
+
+	buffer = &st->buffers[buf.index];
+
+	debug("v4l2_codec: read: index=%u, bytesused=%u\n",
+	      buf.index, buf.bytesused);
 
 	{
 		struct mbuf mb = {0,0,0,0};
 		struct h264_hdr hdr;
 
-		mb.buf = st->buffer;
+		mb.buf = buffer->start;
 		mb.pos = 4;
 		mb.end = buf.bytesused - 4;
 		mb.size = buf.bytesused;
@@ -356,11 +395,12 @@ static void read_handler(int flags, void *arg)
 #endif
 
 	/* pass the frame to the encoders */
-	encoders_read(rtp_ts, st->buffer, buf.bytesused);
+	encoders_read(rtp_ts, buffer->start, buf.bytesused);
 
-	err = query_buffer(st->fd);
-	if (err) {
-		warning("v4l2_codec: query_buffer failed (%m)\n", err);
+ out:
+	if (-1 == xioctl (st->fd, VIDIOC_QBUF, &buf)) {
+		warning("v4l2: VIDIOC_QBUF\n");
+		return;
 	}
 }
 
@@ -388,7 +428,7 @@ static int open_encoder(struct vidsrc_st *st, const char *device,
 	if (err)
 		goto out;
 
-	err = query_buffer(st->fd);
+	err = query_buffers(st);
 	if (err)
 		goto out;
 
@@ -499,6 +539,7 @@ static bool h264_fmtp_cmp(const char *fmtp1, const char *fmtp2, void *data)
 static void src_destructor(void *arg)
 {
 	struct vidsrc_st *st = arg;
+	unsigned int i;
 
 	if (st->fd >=0 ) {
 		info("v4l2_codec: encoder stats"
@@ -508,8 +549,9 @@ static void src_destructor(void *arg)
 
 	stop_capturing(st->fd);
 
-	if (st->buffer)
-		munmap(st->buffer, st->buffer_len);
+	for (i=0; i<st->n_buffers; ++i) {
+		munmap(st->buffers[i].start, st->buffers[i].length);
+	}
 
 	if (st->fd >= 0) {
 		fd_close(st->fd);
