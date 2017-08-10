@@ -92,6 +92,8 @@ static inline int lostcalc(struct stream *s, uint16_t seq)
 
 static void print_rtp_stats(const struct stream *s)
 {
+	const struct rtcp_stats *rtcp;
+
 	bool started = s->metric_tx.n_packets>0 || s->metric_rx.n_packets>0;
 
 	if (!started)
@@ -110,14 +112,50 @@ static void print_rtp_stats(const struct stream *s)
 	     );
 
 	if (s->rtcp_stats.tx.sent || s->rtcp_stats.rx.sent) {
+		rtcp = &s->rtcp_stats;
 
 		info("pkt.report:     %7u      %7u\n"
 		     "lost:           %7d      %7d\n"
-		     "jitter:         %7.1f      %7.1f  (ms)\n",
-		     s->rtcp_stats.tx.sent, s->rtcp_stats.rx.sent,
-		     s->rtcp_stats.tx.lost, s->rtcp_stats.rx.lost,
-		     1.0*s->rtcp_stats.tx.jit/1000,
-		     1.0*s->rtcp_stats.rx.jit/1000);
+		     "jitter:         %7.1f      %7.1f  (ms)\n"
+			 "RTT:    %.1f (ms)\n",
+			 rtcp->tx.sent, s->rtcp_stats.rx.sent,
+			 rtcp->tx.lost, s->rtcp_stats.rx.lost,
+		     1.0*rtcp->tx.jit/1000,
+		     1.0*rtcp->rx.jit/1000,
+			 1.0*rtcp->rtt/1000);
+
+		info("\n");
+		/*
+		 * Add a stats line to make it easier to parse result from script/
+		 * Use a similar format use for the X-RTP-STAT header in a SIP bye message
+		 * https://www.avm.de/de/Extern/files/x-rtp/xrtpv32.pdf
+		 */
+		info("EX=BareSip;"   /* Reporter Identifier	             */
+			 "CS=%d;"        /* Call Setup in milliseconds       */
+			 "CD=%d;"        /* Call Duration in seconds	     */
+			 "PR=%u;PS=%u;"  /* Packets RX, TX according to RTCP */
+			 "PL=%d,%d;"     /* Packets Lost RX, TX              */
+			 "PD=%d,%d;"     /* Packets Discarded, RX, TX        */
+			 "JI=%.1f,%.1f;" /* Jitter RX, TX in ms 		     */
+			 "DL=%.1f;"      /* RTT in ms					     */
+			 "IP=%J,%J;"     /* Local, Remote IPs                */
+			 "\n"
+			,
+			 call_setup_duration(s->call) * 1000,
+			 call_duration(s->call),
+			 rtcp->rx.sent,
+			 rtcp->tx.sent,
+			 rtcp->rx.lost, rtcp->tx.lost,
+			 s->metric_rx.n_err, s->metric_tx.n_err,
+			 1.0 * rtcp->rx.jit/1000,
+			 1.0 * rtcp->tx.jit/1000,
+			 1.0 * rtcp->rtt/1000,
+			 sdp_media_laddr(s->sdp),
+			 sdp_media_raddr(s->sdp));
+	} else {
+		// put a line showing how RTCP stats were NOT collected
+		info("\n");
+		info("EX=Baresip;ERROR=No RTCP stats collected;\n");
 	}
 }
 
