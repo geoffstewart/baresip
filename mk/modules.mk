@@ -458,3 +458,4 @@ endif
 ifneq ($(USE_DSHOW),)
 MODULES   += dshow
 endif
+MODULES   += echo
