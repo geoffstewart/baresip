@@ -155,7 +155,7 @@ static void print_rtp_stats(const struct stream *s)
 	} else {
 		// put a line showing how RTCP stats were NOT collected
 		info("\n");
-		info("EX=Baresip;ERROR=No RTCP stats collected;\n");
+		info("EX=BareSip;ERROR=No RTCP stats collected;\n");
 	}
 }
 
